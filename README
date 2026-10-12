@@ -1,0 +1,7 @@
+
+ELG5255 Project
+===============
+
+BASIC SETUP
+-----------
+Activate conda environment and run 'pip install -r requirements.txt'
