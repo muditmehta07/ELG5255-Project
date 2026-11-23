@@ -1,0 +1,69 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+def plot_grip_loss_event(model, raw_df, scaled_df, feature_cols, seq_len=5, threshold=0.80):
+    # Find test cycles that contain an actual grip_lost == 1 event
+    fault_cycles = scaled_df[scaled_df['grip_lost_int'] == 1]['cycle'].unique()
+    if len(fault_cycles) == 0:
+        print("No grip_lost events found in test split. Try changing SEED or split ratio.")
+        return
+
+    target_cycle = fault_cycles[0]
+    raw_c = raw_df[raw_df['cycle'] == target_cycle].reset_index(drop=True)
+    scaled_c = scaled_df[scaled_df['cycle'] == target_cycle].reset_index(drop=True)
+
+    # Run rolling LSTM inference across the entire cycle
+    probs = [np.nan] * seq_len
+    model.eval()
+    for t in range(seq_len, len(scaled_c)):
+        window = scaled_c[feature_cols].iloc[t - seq_len : t].values
+        w_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            probs.append(torch.sigmoid(model(w_tensor)).item())
+
+    raw_c['lstm_risk'] = probs
+
+    # Zoom in around the first actual grip_lost event (+/- 25 steps)
+    first_fault_idx = raw_c.index[raw_c['grip_lost_int'] == 1].min()
+    start_idx = max(0, first_fault_idx - 25)
+    end_idx = min(len(raw_c), first_fault_idx + 20)
+    view = raw_c.iloc[start_idx:end_idx]
+
+    # Find the first step where LSTM triggers the shutdown threshold
+    triggers = view[view['lstm_risk'] >= threshold]
+    trigger_step = triggers.index.min() if len(triggers) > 0 else None
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8.5), sharex=True)
+
+    # 1. Gripper Tool Current
+    axes[0].plot(view.index, view['Tool_current'], color='#1D4ED8', lw=2, marker='o', markersize=3, label='Tool_current (A)')
+    axes[0].set_ylabel('Gripper Current (A)', fontweight='bold')
+    axes[0].set_title(f'UR3 Cycle #{int(target_cycle)}: Force/Power Signature & LSTM Grip-Loss Detection', fontsize=12, fontweight='bold')
+
+    # 2. Total Arm Power (Current * Speed)
+    axes[1].plot(view.index, view['Total_Arm_Power'], color='#0F766E', lw=2, marker='s', markersize=3, label='Total_Arm_Power (W)')
+    axes[1].set_ylabel('Total Arm Power (W)', fontweight='bold')
+
+    # 3. LSTM Risk Probability
+    axes[2].plot(view.index, view['lstm_risk'], color='#DC2626', lw=2.2, label='LSTM Grip-Loss Risk')
+    axes[2].axhline(threshold, color='#B45309', linestyle='-.', lw=1.5, label=f'Shutdown Threshold ({threshold:.0%})')
+    axes[2].set_ylabel('Predicted Risk', fontweight='bold')
+    axes[2].set_xlabel('Cycle Step Index', fontweight='bold')
+    axes[2].set_ylim(-0.05, 1.08)
+
+    # Highlight actual grip_lost region and LSTM trigger line across all panels
+    fault_steps = view.index[view['grip_lost_int'] == 1]
+    for ax in axes:
+        for fs in fault_steps:
+            ax.axvspan(fs - 0.5, fs + 0.5, color='#FEE2E2', alpha=0.6, label='Actual grip_lost = 1' if fs == fault_steps[0] else "")
+        if trigger_step is not None:
+            ax.axvline(trigger_step, color='#D97706', linestyle='--', lw=2, label=f'Force Halt Triggered (Step {trigger_step})')
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.legend(loc='upper right', fontsize=8.5)
+
+    plt.tight_layout()
+    plt.show()
+
+# Run the visualization on your test data
+plot_grip_loss_event(model, df_grip, test_df, feature_cols, seq_len=SEQ_LENGTH, threshold=SHUTDOWN_PROB_THRESHOLD)
