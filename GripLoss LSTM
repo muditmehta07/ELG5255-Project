@@ -1,0 +1,183 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report
+
+# ==============================================================================
+# 1. CONFIGURATION FOR GRIP LOSS DETECTION
+# ==============================================================================
+SEQ_LENGTH = 5                  # Short 5-step window to capture rapid force/current transients
+FORECAST_HORIZON = 2            # Predict grip loss 1 to 2 time steps ahead
+SHUTDOWN_PROB_THRESHOLD = 0.80  # Trigger halt when grip-loss probability >= 80%
+SEED = 42
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==============================================================================
+# 2. FEATURE ENGINEERING: FORCE, CURRENT & INSTANTANEOUS POWER
+# ==============================================================================
+df_grip = df.copy()
+
+# Clean missing values within each operational cycle
+sensor_cols = [c for c in df_grip.columns if c not in ['Timestamp', 'cycle', 'grip_lost', 'Robot_ProtectiveStop']]
+df_grip[sensor_cols] = df_grip.groupby('cycle')[sensor_cols].ffill().bfill().fillna(0)
+
+# Engineer Instantaneous Joint Power (P = Current * Speed) & Force Proxies
+power_cols = []
+for j in range(6):
+    c_col = f'Current_J{j}'
+    s_col = f'Speed_J{j}'
+    p_col = f'Power_J{j}'
+    if c_col in df_grip.columns and s_col in df_grip.columns:
+        df_grip[p_col] = df_grip[c_col] * df_grip[s_col]
+        power_cols.append(p_col)
+
+# Total arm electrical current & rate-of-change (dI/dt) for gripper and shoulder
+current_cols = [f'Current_J{j}' for j in range(6) if f'Current_J{j}' in df_grip.columns]
+df_grip['Total_Arm_Current'] = df_grip[current_cols].abs().sum(axis=1)
+df_grip['Total_Arm_Power'] = df_grip[power_cols].abs().sum(axis=1)
+df_grip['Tool_Current_Delta'] = df_grip.groupby('cycle')['Tool_current'].diff().fillna(0)
+df_grip['J1_Current_Delta'] = df_grip.groupby('cycle')['Current_J1'].diff().fillna(0)
+
+# Focus features specifically on Current, Speed, Power, and Deltas (drop slow Temperatures)
+feature_cols = [
+    c for c in df_grip.columns 
+    if c not in ['Timestamp', 'cycle', 'grip_lost', 'Robot_ProtectiveStop'] 
+    and 'Temperature' not in c
+]
+
+# ==============================================================================
+# 3. TARGET LABELING & CYCLE-BASED SPLIT
+# ==============================================================================
+# Target = 1 if grip_lost occurs within the next FORECAST_HORIZON steps
+df_grip['grip_lost_int'] = df_grip['grip_lost'].astype(int)
+df_grip['imminent_grip_loss'] = (
+    df_grip.groupby('cycle')['grip_lost_int']
+    .transform(lambda s: s.rolling(FORECAST_HORIZON + 1, min_periods=1).max().shift(-FORECAST_HORIZON))
+).fillna(df_grip['grip_lost_int']).astype(int)
+
+# Split by cycle ID so train and test sets never share overlapping time windows
+cycles_with_faults = df_grip[df_grip['imminent_grip_loss'] == 1]['cycle'].unique()
+all_cycles = df_grip['cycle'].unique()
+
+# Ensure both train and test receive cycles containing real grip_lost events
+np.random.shuffle(all_cycles)
+split_idx = int(len(all_cycles) * 0.75)
+train_cycles = all_cycles[:split_idx]
+test_cycles = all_cycles[split_idx:]
+
+train_df = df_grip[df_grip['cycle'].isin(train_cycles)].copy()
+test_df = df_grip[df_grip['cycle'].isin(test_cycles)].copy()
+
+scaler = StandardScaler()
+train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
+test_df[feature_cols] = scaler.transform(test_df[feature_cols])
+
+def create_sequences(data, features, target, seq_len):
+    X_seq, y_seq = [], []
+    for _, group in data.groupby('cycle'):
+        if len(group) <= seq_len:
+            continue
+        f_vals = group[features].values
+        t_vals = group[target].values
+        for i in range(len(group) - seq_len):
+            X_seq.append(f_vals[i : i + seq_len])
+            y_seq.append(t_vals[i + seq_len - 1])
+    return np.array(X_seq, dtype=np.float32), np.array(y_seq, dtype=np.float32)
+
+X_train, y_train = create_sequences(train_df, feature_cols, 'imminent_grip_loss', SEQ_LENGTH)
+X_test, y_test = create_sequences(test_df, feature_cols, 'imminent_grip_loss', SEQ_LENGTH)
+
+train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(y_train)), batch_size=64, shuffle=True)
+test_loader = DataLoader(TensorDataset(torch.tensor(X_test), torch.tensor(y_test)), batch_size=64, shuffle=False)
+
+# ==============================================================================
+# 4. PYTORCH FORCE/POWER LSTM MODEL & TRAINING
+# ==============================================================================
+class GripLossForceLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        return self.classifier(lstm_out[:, -1, :]).squeeze(-1)
+
+model = GripLossForceLSTM(input_size=len(feature_cols)).to(device)
+
+# Weight positive class heavily since grip_lost is rare compared to normal motion
+pos_count = max(y_train.sum(), 1.0)
+neg_count = max(len(y_train) - pos_count, 1.0)
+pos_weight = torch.tensor([neg_count / pos_count], dtype=torch.float32).to(device)
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+print(f"Training GripLossForceLSTM on {len(X_train)} real sequences ({int(pos_count)} positive windows)...")
+for epoch in range(20):
+    model.train()
+    total_loss = 0.0
+    for bx, by in train_loader:
+        bx, by = bx.to(device), by.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model(bx), by)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    if (epoch + 1) % 5 == 0:
+        print(f"  Epoch {epoch+1:02d}/20 | Loss: {total_loss / len(train_loader):.4f}")
+
+# ==============================================================================
+# 5. EVALUATE & SIMULATE FORCE SHUTDOWN ON REAL GRIP-LOSS CYCLE
+# ==============================================================================
+model.eval()
+preds, targets = [], []
+with torch.no_grad():
+    for bx, by in test_loader:
+        probs = torch.sigmoid(model(bx.to(device))).cpu().numpy()
+        preds.extend((probs >= SHUTDOWN_PROB_THRESHOLD).astype(int))
+        targets.extend(by.numpy().astype(int))
+
+print("\n--- Test Set Grip-Loss Detection Report ---")
+print(classification_report(targets, preds, target_names=["Normal Grip", "Imminent Grip Loss"], zero_division=0))
+
+# Pick a test cycle that actually has a recorded grip_lost event to inspect power/current response
+fault_test_cycles = test_df[test_df['grip_lost_int'] == 1]['cycle'].unique()
+if len(fault_test_cycles) > 0:
+    sample_cycle = fault_test_cycles[0]
+    raw_cycle = df_grip[df_grip['cycle'] == sample_cycle].reset_index(drop=True)
+    scaled_cycle = test_df[test_df['cycle'] == sample_cycle].reset_index(drop=True)
+    
+    print(f"\nInspecting real fault cycle #{int(sample_cycle)}:")
+    for t in range(SEQ_LENGTH, len(scaled_cycle)):
+        window = scaled_cycle[feature_cols].iloc[t - SEQ_LENGTH : t].values
+        w_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            prob = torch.sigmoid(model(w_tensor)).item()
+            
+        actual_loss = raw_cycle['grip_lost_int'].iloc[t]
+        tool_curr = raw_cycle['Tool_current'].iloc[t]
+        arm_pwr = raw_cycle['Total_Arm_Power'].iloc[t]
+        
+        if prob >= SHUTDOWN_PROB_THRESHOLD or actual_loss == 1:
+            print(f"Step {t:03d} | Tool Current: {tool_curr:6.3f}A | Total Power: {arm_pwr:6.3f}W | "
+                  f"LSTM Risk: {prob:6.2%} | Actual grip_lost: {actual_loss}")
+            if prob >= SHUTDOWN_PROB_THRESHOLD:
+                print(f"--> [FORCE HALT TRIGGERED] Imminent grip loss predicted from current/power drop!")
+                break
