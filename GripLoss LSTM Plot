@@ -2,6 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+device = torch.device
+
 def plot_grip_loss_event(model, raw_df, scaled_df, feature_cols, seq_len=5, threshold=0.80):
     # Find test cycles that contain an actual grip_lost == 1 event
     fault_cycles = scaled_df[scaled_df['grip_lost_int'] == 1]['cycle'].unique()
